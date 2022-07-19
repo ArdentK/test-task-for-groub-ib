@@ -1,13 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"net/http"
+	"strconv"
+	"time"
 )
 
 var (
-	errNotFound = errors.New("not found")
+	errNotFound  = errors.New("not found")
+	errNoTimeout = errors.New("no timeout")
 )
 
 type KeyValue struct {
@@ -22,7 +26,7 @@ type MyStack struct {
 func (s *MyStack) CreateQueue(key, value string) (*KeyValue, error) {
 	newElem := &KeyValue{
 		key:   key,
-		value: make([]string, 1),
+		value: make([]string, 0),
 	}
 	newElem.value = append(newElem.value, value)
 	s.data = append(s.data, newElem)
@@ -72,9 +76,7 @@ func NewMemoryRepo() *QueuesMemoryRepo {
 
 func (repo *QueuesMemoryRepo) Get(key string) (string, error) {
 	elem, err := repo.data.findByKey(key)
-	if err == errNotFound {
-		return "", err
-	} else if err != nil {
+	if err != nil {
 		return "", err
 	}
 
@@ -119,21 +121,41 @@ type QueueHandler struct {
 	Repo QueuesRepo
 }
 
-func (q *QueueHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
-	pathname := r.URL.Path
-	res, err := q.Repo.Get(pathname[1:])
+func ParseTimeout(r *http.Request) (int64, error) {
+	t := r.URL.Query().Get("timeout")
+	if len(t) == 0 {
+		return 0, errNoTimeout
+	}
+	timeout, err := strconv.ParseInt(t, 10, 64)
+	if err != nil {
+		return 0, err
+	}
 
-	timeout := r.URL.Query().Get("timeout")
+	return timeout, nil
+}
+
+func (q *QueueHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
+	timeout, err := ParseTimeout(r)
+	if err != nil && err != errNoTimeout {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	res, err := q.Repo.Get(r.URL.Path[1:])
+
+	for i := 0; i < int(timeout) && err != nil; i++ {
+		res, err = q.Repo.Get(r.URL.Path[1:])
+		time.Sleep(time.Second)
+	}
 
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(err)
 		return
 	}
-	_, err = w.Write([]byte(res))
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(res)
 }
 
 func (q *QueueHandler) HandlePut(w http.ResponseWriter, r *http.Request) {
@@ -142,12 +164,14 @@ func (q *QueueHandler) HandlePut(w http.ResponseWriter, r *http.Request) {
 
 	if len(param) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(http.StatusBadRequest)
 		return
 	}
 
 	err := q.Repo.Put(pathname[1:], param)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(err)
 		return
 	}
 
@@ -163,7 +187,7 @@ func (q *QueueHandler) Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	port := flag.String("port", ":8080", "an int")
+	port := flag.String("port", ":8080", "port")
 	flag.Parse()
 
 	queueRepo := NewMemoryRepo()
